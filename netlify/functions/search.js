@@ -1,56 +1,74 @@
 // netlify/functions/search.js
-const YouTubeMusicApi = require('youtube-music-api'); // package name: youtube-music-api
+const YouTubeMusicApi = require('youtube-music-api');
 
-exports.handler = async function (event, context) {
+const DEFAULT_HEADERS = {
+  "Content-Type": "application/json",
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Methods": "GET, OPTIONS"
+};
+
+function normalize(raw) {
+  // raw may be the wrapper object containing results.content OR already a simple list
+  const content = (raw && raw.results && Array.isArray(raw.results.content)) ? raw.results.content :
+                  (raw && Array.isArray(raw.items)) ? raw.items :
+                  (raw && Array.isArray(raw.content)) ? raw.content : [];
+
+  return (content || []).map(it => ({
+    id: it.videoId || (it.playlistId && it.playlistId[0]) || null,
+    videoId: it.videoId || null,
+    title: it.name || it.title || '',
+    artist: (it.artist && it.artist.name) || (Array.isArray(it.artist) ? it.artist.map(a=>a.name).join(', ') : '') || '',
+    album: (it.album && it.album.name) || '',
+    durationMs: it.duration || 0,
+    thumbnails: it.thumbnails || [],
+    raw: it
+  }));
+}
+
+exports.handler = async function (event) {
+  // handle preflight
+  if (event.httpMethod === 'OPTIONS') {
+    return { statusCode: 204, headers: DEFAULT_HEADERS, body: '' };
+  }
+
   try {
-    // validate query param
     const params = event.queryStringParameters || {};
-    const q = params.q || params.query || '';
+    const q = (params.q || '').trim();
+    const type = params.type || 'song';
+    const limit = Math.min(parseInt(params.limit || '12', 10) || 12, 50);
 
-    if (!q || q.trim().length === 0) {
+    if (!q) {
       return {
         statusCode: 400,
-        body: JSON.stringify({ error: 'Missing query parameter "q". Example: ?q=never%20gonna%20give%20you%20up' })
+        headers: DEFAULT_HEADERS,
+        body: JSON.stringify({ error: 'Missing query param q' })
       };
     }
 
-    // initialize the API
     const api = new YouTubeMusicApi();
-    // IMPORTANT: initialize() must be awaited before using search()
     await api.initalize();
 
-    // optional second param: 'song' | 'video' | 'album' | 'artist' | 'playlist'
-    // if you want all types, call with unspecified type or call multiple searches
-    const type = params.type || 'song';
+    const raw = await api.search(q, type);
 
-    // call search
-    const results = await api.search(q, type);
+    const items = normalize(raw).slice(0, limit);
 
-    // results usually contain multiple categories; return what you need
     return {
       statusCode: 200,
-      headers: {
-        "Content-Type": "application/json"
-      },
+      headers: DEFAULT_HEADERS,
       body: JSON.stringify({
         query: q,
         type,
-        results
+        items,
+        continuation: raw && raw.continuation ? raw.continuation : null
       })
     };
   } catch (err) {
-    // Log full error server-side (Netlify will show this in function logs)
-    console.error('YouTube Music fetch error:', err);
-
-    // try to include more helpful details in the response for debugging
-    const details = (err && err.response && err.response.data) ? err.response.data : (err && err.message) ? err.message : err;
-
+    console.error('search function error:', err && (err.stack || err));
     return {
       statusCode: 500,
-      body: JSON.stringify({
-        error: 'Failed to fetch data from YouTube Music.',
-        details: details
-      })
+      headers: DEFAULT_HEADERS,
+      body: JSON.stringify({ error: 'Server error', details: err && (err.message || String(err)) })
     };
   }
 };
