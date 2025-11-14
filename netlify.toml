@@ -1,0 +1,10 @@
+# netlify.toml
+
+[build]
+  # This command is not strictly necessary for a functions-only site
+  # but it's good practice. Netlify will still deploy functions.
+  command = "echo 'No build command needed'"
+
+[functions]
+  # Tells Netlify that all functions are in the "netlify/functions" directory
+  directory = "netlify/functions"
