@@ -1,10 +1,8 @@
 // netlify/functions/search.js
 
-// CORRECTED: Import the library without .default
-const YTMusic = require('ytmusic-api');
-
 exports.handler = async (event, context) => {
-    console.log('Function invoked! Query:', event.queryStringParameters.q);
+    // Use dynamic import() to correctly load the ES Module
+    const { default: YTMusic } = await import('ytmusic-api');
 
     const query = event.queryStringParameters.q;
 
@@ -16,13 +14,10 @@ exports.handler = async (event, context) => {
     }
 
     try {
-        // CORRECTED: Instantiate the API by awaiting the function call
-        const ytmusic = await YTMusic();
+        // Now we can correctly use 'new' to create an instance
+        const ytmusic = new YTMusic();
         
-        // Perform the search. The method is just .search()
         const searchResults = await ytmusic.search(query);
-
-        // The results are in a 'songs' array
         const songs = searchResults.songs || [];
 
         return {
@@ -32,7 +27,6 @@ exports.handler = async (event, context) => {
                 'Access-Control-Allow-Origin': '*', 
                 'Access-Control-Allow-Headers': 'Content-Type',
             },
-            // Send back the first 5 results as JSON
             body: JSON.stringify(songs.slice(0, 5)),
         };
 
