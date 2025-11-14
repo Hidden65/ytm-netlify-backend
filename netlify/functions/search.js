@@ -1,10 +1,9 @@
 // netlify/functions/search.js
 
-// The correct way to import the library for a CommonJS module (Netlify Functions)
-const YTMusic = require('ytmusic-api').default;
+// CORRECTED: Import the library without .default
+const YTMusic = require('ytmusic-api');
 
 exports.handler = async (event, context) => {
-    // This log will appear in your Netlify function logs
     console.log('Function invoked! Query:', event.queryStringParameters.q);
 
     const query = event.queryStringParameters.q;
@@ -17,20 +16,19 @@ exports.handler = async (event, context) => {
     }
 
     try {
-        // 1. Instantiate the API
-        const ytmusic = new YTMusic();
+        // CORRECTED: Instantiate the API by awaiting the function call
+        const ytmusic = await YTMusic();
         
-        // 2. Perform the search. The method is just .search()
+        // Perform the search. The method is just .search()
         const searchResults = await ytmusic.search(query);
 
-        // 3. The results are in a 'songs' array
+        // The results are in a 'songs' array
         const songs = searchResults.songs || [];
 
         return {
             statusCode: 200,
             headers: {
                 'Content-Type': 'application/json',
-                // Add CORS headers to allow your frontend to call this
                 'Access-Control-Allow-Origin': '*', 
                 'Access-Control-Allow-Headers': 'Content-Type',
             },
@@ -39,7 +37,7 @@ exports.handler = async (event, context) => {
         };
 
     } catch (error) {
-        console.error("Search failed:", error); // This error will also be in the logs
+        console.error("Search failed:", error);
         return {
             statusCode: 500,
             body: JSON.stringify({ error: 'Failed to fetch data from YouTube Music.', details: error.message }),
