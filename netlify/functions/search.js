@@ -3,39 +3,89 @@ const YouTubeMusicApi = require('youtube-music-api');
 
 // Helper: normalize various item shapes returned by youtube-music-api
 function normalizeItem(raw, typeHint) {
-  // The third-party lib can return different fields depending on type.
-  // We'll extract common fields safely.
-  const type = typeHint || raw.type || detectType(raw);
-  const title = raw.title || raw.name || raw.subtitle || '';
-  const id = raw.videoId || raw.entityId || raw.browseId || raw.id || raw.video_id || '';
-  const artists = (raw.artists || raw.artist || raw.subtitles || [])
-    .map(a => (a && (a.name || a.title)) || (typeof a === 'string' ? a : null))
-    .filter(Boolean);
-  const thumbnails = raw.thumbnails || raw.thumbnail || raw.thumbs || [];
-  const duration = raw.duration || raw.length || null;
+  try {
+    // Defensive helpers for artists/subtitles/thumbnails/duration
+    const coerceToArray = (val) => {
+      if (!val && val !== 0) return [];
+      if (Array.isArray(val)) return val;
+      // If it's an object with numeric keys or 'name' prop, try to extract
+      if (typeof val === 'object') {
+        // common shape: { name: 'Artist' } or {0: {...}, 1: {...}}
+        if (val.name && typeof val.name === 'string') return [{ name: val.name }];
+        // flatten object values
+        return Object.values(val).filter(Boolean);
+      }
+      // string -> single element array
+      return [val];
+    };
 
-  // Construct YouTube URLs when a videoId is available
-  const videoId = raw.videoId || raw.id || (raw.url && extractVideoId(raw.url)) || null;
-  const watchUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : null;
-  const embedUrl = videoId ? `https://www.youtube.com/embed/${videoId}` : null;
+    const extractNameFromArtistEntry = (a) => {
+      if (!a && a !== 0) return null;
+      if (typeof a === 'string') return a;
+      if (typeof a === 'object') {
+        // common object shapes: { name: 'X' } or { title: 'X' } or { id: '...', name: 'X' }
+        return a.name || a.title || a.artist || null;
+      }
+      return null;
+    };
 
-  return {
-    type,
-    id,
-    title,
-    artists,
-    thumbnails,
-    duration,
-    raw,
-    videoId,
-    watchUrl,
-    embedUrl
-  };
+    const type = typeHint || raw.type || detectType(raw);
+    const title = raw.title || raw.name || raw.subtitle || '';
+    const id = raw.videoId || raw.entityId || raw.browseId || raw.id || raw.video_id || '';
+    // artists / subtitles normalization (defensive)
+    const artistsRaw = raw.artists || raw.artist || raw.subtitles || [];
+    const artistsArr = coerceToArray(artistsRaw);
+    const artists = artistsArr
+      .map(extractNameFromArtistEntry)
+      .filter(Boolean);
+
+    // thumbnails can be a single object, an array, or nested
+    let thumbnails = [];
+    if (Array.isArray(raw.thumbnails)) thumbnails = raw.thumbnails;
+    else if (raw.thumbnail) thumbnails = (Array.isArray(raw.thumbnail) ? raw.thumbnail : [raw.thumbnail]);
+    else if (raw.thumbs) thumbnails = raw.thumbs;
+    else thumbnails = [];
+
+    const duration = raw.duration || raw.length || raw.duration_seconds || null;
+
+    // Construct YouTube URLs when a videoId is available
+    const videoId = raw.videoId || raw.id || (raw.url && extractVideoId(raw.url)) || null;
+    const watchUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : null;
+    const embedUrl = videoId ? `https://www.youtube.com/embed/${videoId}` : null;
+
+    return {
+      type,
+      id,
+      title,
+      artists,
+      thumbnails,
+      duration,
+      raw,
+      videoId,
+      watchUrl,
+      embedUrl
+    };
+  } catch (err) {
+    // Don't throw — return a best-effort minimal object and include the error message
+    return {
+      type: typeHint || (raw && raw.type) || 'unknown',
+      id: raw && (raw.videoId || raw.id || raw.entityId) || null,
+      title: raw && (raw.title || raw.name) || null,
+      artists: [],
+      thumbnails: [],
+      duration: null,
+      raw,
+      videoId: raw && (raw.videoId || raw.id) || null,
+      watchUrl: null,
+      embedUrl: null,
+      // warning helps debugging in logs without crashing entire function
+      warning: 'normalizeItem failed: ' + (err && err.message ? err.message : String(err))
+    };
+  }
 }
 
 function extractVideoId(url) {
   if (!url) return null;
-  // crude extractor for common watch URLs
   const m = url.match(/[?&]v=([^&]+)/) || url.match(/\/watch\/([^?&/]+)/) || url.match(/\/embed\/([^?&/]+)/);
   return m ? m[1] : null;
 }
@@ -45,7 +95,6 @@ function detectType(raw) {
   if (raw.type) return raw.type;
   if (raw.videoId) return 'song';
   if (raw.browseId && raw.title && raw.subtitle && raw.thumbnail) {
-    // heuristics
     if ((raw.subtitle || '').toLowerCase().includes('songs') || (raw.subtitle || '').toLowerCase().includes('tracks')) {
       return 'album';
     }
@@ -54,7 +103,6 @@ function detectType(raw) {
 }
 
 exports.handler = async function (event, context) {
-  // Basic CORS + allow from your frontend (adjust origin in production)
   const defaultHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Content-Type",
@@ -76,8 +124,6 @@ exports.handler = async function (event, context) {
     }
 
     const api = new YouTubeMusicApi();
-    // NOTE: this lib's init fn is often misspelled as "initalize" in published versions
-    // the older package requires "await api.initalize();" (spelled that way). If your installed package exposes "initialize", try that.
     if (typeof api.initalize === 'function') {
       await api.initalize();
     } else if (typeof api.initialize === 'function') {
@@ -86,48 +132,36 @@ exports.handler = async function (event, context) {
       await api.init();
     }
 
-    // If a specific type is asked, attempt one search. Otherwise do a general search.
-    // youtube-music-api supports a 'section' argument (some versions) or type hint; we use the common `search(query, type)` API.
     let rawResults;
     if (type && ['song', 'video', 'album', 'artist', 'playlist'].includes(type)) {
       rawResults = await api.search(q, type);
     } else {
-      rawResults = await api.search(q); // full search (returns grouped results)
+      rawResults = await api.search(q);
     }
 
-    // rawResults may be an object with sections or arrays depending on library version.
-    // Normalize into a flat `items` array with `{ type, id, title, artists, thumbnails, videoId, watchUrl, embedUrl }`.
     let items = [];
 
-    // Common shapes:
-    // 1) { resultCount: 10, content: [...] } or { result: [...] }
-    // 2) { songs: {...}, albums: {...}, videos: {...} }
-    // 3) direct array returned
     if (Array.isArray(rawResults)) {
       items = rawResults.map(r => normalizeItem(r));
     } else if (rawResults && typeof rawResults === 'object') {
-      // try known keys
       const possibleKeys = ['songs', 'albums', 'videos', 'artists', 'playlists', 'result', 'content', 'resultArray', 'results'];
       let found = false;
       for (const k of possibleKeys) {
         if (rawResults[k]) {
           found = true;
           const block = rawResults[k];
-          // block might be an object with 'results' or 'contents' array
           if (Array.isArray(block)) {
             items = items.concat(block.map(r => normalizeItem(r, inferTypeFromKey(k))));
           } else if (block && Array.isArray(block.results || block.contents || block.items)) {
             const arr = block.results || block.contents || block.items;
             items = items.concat(arr.map(r => normalizeItem(r, inferTypeFromKey(k))));
           } else if (block && typeof block === 'object') {
-            // maybe { results: [...] }
             const arr = block.results || block.contents || block.items || [];
             items = items.concat((Array.isArray(arr) ? arr : []).map(r => normalizeItem(r, inferTypeFromKey(k))));
           }
         }
       }
       if (!found) {
-        // fallback: flatten any top-level arrays or object values
         for (const v of Object.values(rawResults)) {
           if (Array.isArray(v)) {
             items = items.concat(v.map(r => normalizeItem(r)));
@@ -136,7 +170,6 @@ exports.handler = async function (event, context) {
       }
     }
 
-    // optional: trim to limit
     items = items.slice(0, limit);
 
     return {
@@ -155,7 +188,7 @@ exports.handler = async function (event, context) {
     const message = err && err.message ? err.message : String(err);
     return {
       statusCode: 500,
-      headers: { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" },
+      headers: defaultHeaders,
       body: JSON.stringify({ error: 'Failed to search YouTube Music', details: message })
     };
   }
