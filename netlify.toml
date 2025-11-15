@@ -5,6 +5,7 @@
   NODE_VERSION = "18"
 
 [[redirects]]
-  from = "/api"
-  to = "/.netlify/functions/api"
+  from = "/search"
+  to = "/.netlify/functions/search"
   status = 200
+
