@@ -9,3 +9,44 @@
   to = "/.netlify/functions/search"
   status = 200
 
+[[redirects]]
+  from = "/album"
+  to = "/.netlify/functions/album"
+  status = 200
+
+[[redirects]]
+  from = "/artist"
+  to = "/.netlify/functions/artist"
+  status = 200
+
+[[redirects]]
+  from = "/lyrics"
+  to = "/.netlify/functions/lyrics"
+  status = 200
+
+[[redirects]]
+  from = "/playlist"
+  to = "/.netlify/functions/playlist"
+  status = 200
+
+[[redirects]]
+  from = "/recommendations"
+  to = "/.netlify/functions/recommendations"
+  status = 200
+
+[[redirects]]
+  from = "/search_multi"
+  to = "/.netlify/functions/search_multi"
+  status = 200
+
+[[redirects]]
+  from = "/suggestions"
+  to = "/.netlify/functions/suggestions"
+  status = 200  
+
+[[redirects]]
+  from = "/trending"
+  to = "/.netlify/functions/trending"
+  status = 200
+
+  
