@@ -1,21 +1,19 @@
 // netlify/functions/search.js
+// Prereq: npm install youtube-music-api
+// Optional: npm install newpipe-extractor-js youtube-dl-exec
+
 const YouTubeMusicApi = require('youtube-music-api');
 
-// Helper: normalize various item shapes returned by youtube-music-api
+// ------------------ Helpers (normalize, detect, extract video id) ------------------
 function normalizeItem(raw, typeHint) {
   try {
-    // Defensive helpers for artists/subtitles/thumbnails/duration
     const coerceToArray = (val) => {
       if (!val && val !== 0) return [];
       if (Array.isArray(val)) return val;
-      // If it's an object with numeric keys or 'name' prop, try to extract
       if (typeof val === 'object') {
-        // common shape: { name: 'Artist' } or {0: {...}, 1: {...}}
         if (val.name && typeof val.name === 'string') return [{ name: val.name }];
-        // flatten object values
         return Object.values(val).filter(Boolean);
       }
-      // string -> single element array
       return [val];
     };
 
@@ -23,7 +21,6 @@ function normalizeItem(raw, typeHint) {
       if (!a && a !== 0) return null;
       if (typeof a === 'string') return a;
       if (typeof a === 'object') {
-        // common object shapes: { name: 'X' } or { title: 'X' } or { id: '...', name: 'X' }
         return a.name || a.title || a.artist || null;
       }
       return null;
@@ -32,14 +29,10 @@ function normalizeItem(raw, typeHint) {
     const type = typeHint || raw.type || detectType(raw);
     const title = raw.title || raw.name || raw.subtitle || '';
     const id = raw.videoId || raw.entityId || raw.browseId || raw.id || raw.video_id || '';
-    // artists / subtitles normalization (defensive)
     const artistsRaw = raw.artists || raw.artist || raw.subtitles || [];
     const artistsArr = coerceToArray(artistsRaw);
-    const artists = artistsArr
-      .map(extractNameFromArtistEntry)
-      .filter(Boolean);
+    const artists = artistsArr.map(extractNameFromArtistEntry).filter(Boolean);
 
-    // thumbnails can be a single object, an array, or nested
     let thumbnails = [];
     if (Array.isArray(raw.thumbnails)) thumbnails = raw.thumbnails;
     else if (raw.thumbnail) thumbnails = (Array.isArray(raw.thumbnail) ? raw.thumbnail : [raw.thumbnail]);
@@ -47,26 +40,12 @@ function normalizeItem(raw, typeHint) {
     else thumbnails = [];
 
     const duration = raw.duration || raw.length || raw.duration_seconds || null;
-
-    // Construct YouTube URLs when a videoId is available
     const videoId = raw.videoId || raw.id || (raw.url && extractVideoId(raw.url)) || null;
     const watchUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : null;
     const embedUrl = videoId ? `https://www.youtube.com/embed/${videoId}` : null;
 
-    return {
-      type,
-      id,
-      title,
-      artists,
-      thumbnails,
-      duration,
-      raw,
-      videoId,
-      watchUrl,
-      embedUrl
-    };
+    return { type, id, title, artists, thumbnails, duration, raw, videoId, watchUrl, embedUrl };
   } catch (err) {
-    // Don't throw — return a best-effort minimal object and include the error message
     return {
       type: typeHint || (raw && raw.type) || 'unknown',
       id: raw && (raw.videoId || raw.id || raw.entityId) || null,
@@ -78,7 +57,6 @@ function normalizeItem(raw, typeHint) {
       videoId: raw && (raw.videoId || raw.id) || null,
       watchUrl: null,
       embedUrl: null,
-      // warning helps debugging in logs without crashing entire function
       warning: 'normalizeItem failed: ' + (err && err.message ? err.message : String(err))
     };
   }
@@ -102,16 +80,21 @@ function detectType(raw) {
   return 'other';
 }
 
-// ------------------ NewPipe extraction helpers ------------------
+function inferTypeFromKey(k) {
+  if (!k) return null;
+  k = k.toLowerCase();
+  if (k.includes('song') || k.includes('songs') || k.includes('video')) return 'song';
+  if (k.includes('album')) return 'album';
+  if (k.includes('artist')) return 'artist';
+  if (k.includes('playlist')) return 'playlist';
+  if (k.includes('video')) return 'video';
+  return null;
+}
 
-// Try to call common export names on community NewPipe JS ports.
-// This is defensive: packages differ; we attempt a few names.
-// Replace your existing tryNewPipeExtract with this improved version
+// ------------------ NewPipe extraction helpers (robust) ------------------
 const util = require('util');
-const child_process = require('child_process');
 
 async function tryNewPipeExtract(videoId) {
-  // helper that inspects a module and returns keys and basic info
   function inspectModule(m) {
     try {
       if (!m) return { type: 'undefined' };
@@ -124,7 +107,6 @@ async function tryNewPipeExtract(videoId) {
     }
   }
 
-  // Try list of probable package names
   const packageNames = [
     'newpipe-extractor-js',
     'newpipe-extractor',
@@ -146,26 +128,19 @@ async function tryNewPipeExtract(videoId) {
       break;
     } catch (err) {
       lastRequireError = err;
-      // continue
     }
   }
 
-  // If still not loaded, try default require (in case user installed under different name)
   if (!loaded) {
     try {
-      // try requiring the installed module by using the main name if present
-      // This will normally fail but gives a clearer error we can return
       // eslint-disable-next-line global-require
       loaded = require('newpipe-extractor-js');
       whichPackage = 'newpipe-extractor-js';
     } catch (err) {
-      // failed to require any expected package
-      // Return an error object that the caller can convert to a 500 with details
       throw new Error('No NewPipe extractor package found. Require attempts failed. Last require error: ' + (lastRequireError && lastRequireError.message ? lastRequireError.message : String(lastRequireError)));
     }
   }
 
-  // Log inspection to function logs for debugging (helps determine API)
   try {
     const inspectInfo = inspectModule(loaded);
     console.log('Loaded NewPipe module:', whichPackage, inspectInfo);
@@ -173,37 +148,30 @@ async function tryNewPipeExtract(videoId) {
     console.log('Loaded NewPipe module but inspect failed:', e && e.message ? e.message : e);
   }
 
-  // Try a set of known function names and call patterns
   const callAttempts = [
-    // direct named functions
     async (mod) => mod.getInfo && await mod.getInfo(videoId),
     async (mod) => mod.getVideoInfo && await mod.getVideoInfo(videoId),
     async (mod) => mod.getStreams && await mod.getStreams(videoId),
     async (mod) => mod.getStreamInfo && await mod.getStreamInfo(videoId),
     async (mod) => mod.extract && await mod.extract(videoId),
     async (mod) => mod.fetchInfo && await mod.fetchInfo(videoId),
-    // default export as function
     async (mod) => (typeof mod === 'function' ? await mod(videoId) : null),
     async (mod) => (mod.default && typeof mod.default === 'function' ? await mod.default(videoId) : null),
-    // some libs expose a 'video' or 'videoInfo' namespace
     async (mod) => (mod.video && typeof mod.video.getInfo === 'function' ? await mod.video.getInfo(videoId) : null),
     async (mod) => (mod.videoInfo && typeof mod.videoInfo.get === 'function' ? await mod.videoInfo.get(videoId) : null)
   ];
 
   let info = null;
-  // attempt calls against loaded module and also its .default (if present)
   for (const attempt of callAttempts) {
     try {
       info = await attempt(loaded);
       if (info) break;
     } catch (err) {
-      // swallow and continue trying others
       console.log('NewPipe call attempt failed (continuing):', err && err.message ? err.message : String(err));
       continue;
     }
   }
 
-  // try against default export if not tried above
   if (!info && loaded && loaded.default) {
     for (const attempt of callAttempts) {
       try {
@@ -216,32 +184,18 @@ async function tryNewPipeExtract(videoId) {
     }
   }
 
-  // If NewPipe-style module returned nothing useful, fallback to youtube-dl-exec (yt-dlp wrapper)
+  // Fallback to youtube-dl-exec if available
   if (!info) {
-    // attempt youtube-dl-exec (which can use yt-dlp binary) as a fallback
     try {
-      // dynamic require to avoid hard dependency if not desired
       // eslint-disable-next-line global-require
-      const ytdlExec = require('youtube-dl-exec'); // or 'youtube-dl-exec'
+      const ytdlExec = require('youtube-dl-exec');
       console.log('Falling back to youtube-dl-exec for metadata extraction');
 
-      // call with json metadata only, no download
-      const execOpts = {
-        dumpSingleJson: true,
-        noWarnings: true,
-        preferFreeFormats: true,
-        // additional args can be added as needed
-      };
-
-      // youtube-dl-exec returns a promise that resolves with json if used as function
-      // some wrappers expect CLI args array; try common patterns
       let meta = null;
       try {
-        // pattern: ytdlExec(url, options)
         meta = await ytdlExec(`https://www.youtube.com/watch?v=${videoId}`, { dumpSingleJson: true, noCheckCertificates: true });
       } catch (errA) {
         try {
-          // pattern: ytdlExec.exec([...])
           if (typeof ytdlExec === 'function') {
             meta = await ytdlExec(`https://www.youtube.com/watch?v=${videoId}`, ['-j']);
           }
@@ -252,11 +206,10 @@ async function tryNewPipeExtract(videoId) {
       }
 
       if (meta) {
-        // normalize meta into {streams/formats: [...] } shape similar to NewPipe expectation
         const formats = Array.isArray(meta.formats) ? meta.formats : [];
         const normalized = formats.map(f => {
           return {
-            url: f.url || f.direct_url || f.protocol && f.protocol + '://' + f.url,
+            url: f.url || f.direct_url || (f.protocol && f.protocol + '://' + f.url),
             mimeType: f.ext || f.format || null,
             bitrate: f.bitrate || f.tbr || null,
             audioBitrate: f.abr || null,
@@ -272,23 +225,18 @@ async function tryNewPipeExtract(videoId) {
   }
 
   if (!info) {
-    // If we reached here, we couldn't obtain metadata. Provide helpful diagnostic info:
-    // Inspect the loaded module keys again and include a short message.
     const modInfo = inspectModule(loaded);
     const diag = `NewPipe extractor did not return info (incompatible API). Module: ${whichPackage}. Module keys: ${JSON.stringify(modInfo.keys || [])}`;
-    // attach lastRequireError message if we have it
     if (lastRequireError && lastRequireError.message) {
       console.log('Last require error:', lastRequireError.message);
     }
     throw new Error(diag);
   }
 
-  // If we have 'info' but not 'formats', attempt to find arrays within 'info'
   let formats = [];
   if (Array.isArray(info.formats)) formats = info.formats;
   else if (Array.isArray(info.streams)) formats = info.streams;
   else {
-    // find first array-like property that looks like formats
     for (const v of Object.values(info)) {
       if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
         formats = v;
@@ -297,7 +245,6 @@ async function tryNewPipeExtract(videoId) {
     }
   }
 
-  // normalize formats array to expected output (same logic as before)
   const normalizedFormats = (formats || []).map((f) => {
     try {
       const url = f.url || f.uri || f.downloadUrl || f.direct_url || f.directUrl || f.cdnUrl || null;
@@ -305,7 +252,7 @@ async function tryNewPipeExtract(videoId) {
       const bitrate = f.bitrate || f.bps || f.tbr || null;
       const audioBitrate = f.audioBitrate || f.abr || null;
       const qualityLabel = f.qualityLabel || f.quality || f.label || f.format_note || null;
-      const isAudioOnly = !!(mimeType && (mimeType.includes && mimeType.includes('audio')) || (f.acodec && !f.vcodec) || (f.vcodec === 'none'));
+      const isAudioOnly = !!((mimeType && mimeType.includes && mimeType.includes('audio')) || (f.acodec && !f.vcodec) || (f.vcodec === 'none'));
       return { url, mimeType, bitrate, audioBitrate, qualityLabel, isAudioOnly, raw: f };
     } catch (err) {
       return { url: null, mimeType: null, bitrate: null, audioBitrate: null, qualityLabel: null, isAudioOnly: false, raw: f };
@@ -314,3 +261,110 @@ async function tryNewPipeExtract(videoId) {
 
   return { info, formats: normalizedFormats };
 }
+
+// ------------------ Utility for selecting best audio ------------------
+function pickBestAudio(formats) {
+  if (!Array.isArray(formats) || formats.length === 0) return null;
+  const audioOnly = formats.filter(f => f.isAudioOnly);
+  const sortByAudioQuality = (a, b) => {
+    const ab = Number(a.audioBitrate || a.bitrate || 0);
+    const bb = Number(b.audioBitrate || b.bitrate || 0);
+    return bb - ab;
+  };
+  if (audioOnly.length > 0) {
+    audioOnly.sort(sortByAudioQuality);
+    return audioOnly[0];
+  }
+  const byBitrate = formats.slice().sort((a, b) => (Number(b.bitrate || 0) - Number(a.bitrate || 0)));
+  return byBitrate[0];
+}
+
+// ------------------ Netlify handler ------------------
+exports.handler = async function (event, context) {
+  const defaultHeaders = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Content-Type": "application/json"
+  };
+
+  try {
+    const params = event.queryStringParameters || {};
+    const q = (params.q || params.query || '').trim();
+    const type = (params.type || '').trim().toLowerCase();
+    const limit = Math.min(50, parseInt(params.limit || '25', 10) || 25);
+
+    const extract = (params.extract === 'true' || params.action === 'extract' || params.extract === '1');
+    const videoIdParam = (params.videoId || params.id || params.video || params.v || '').trim();
+
+    if (extract) {
+      if (!videoIdParam) {
+        return { statusCode: 400, headers: defaultHeaders, body: JSON.stringify({ error: 'Missing videoId for extraction. Use ?extract=true&videoId=<id>' }) };
+      }
+      try {
+        const prefer = (params.extract_prefer || 'audio').toLowerCase();
+        const exLimit = Math.min(50, parseInt(params.extract_limit || '10', 10) || 10);
+        const npResult = await tryNewPipeExtract(videoIdParam);
+        const formats = npResult.formats || [];
+        const best = prefer === 'video' ? (formats[0] || null) : pickBestAudio(formats);
+        const reply = { extractor: 'newpipe-extractor-js-or-fallback', videoId: videoIdParam, info: npResult.info || null, availableFormatsCount: formats.length, formats: formats.slice(0, exLimit), best };
+        return { statusCode: 200, headers: defaultHeaders, body: JSON.stringify(reply) };
+      } catch (err) {
+        console.error('NewPipe extraction failed:', err && err.message ? err.message : String(err));
+        return { statusCode: 500, headers: defaultHeaders, body: JSON.stringify({ error: 'Extraction failed', details: err && err.message ? err.message : String(err) }) };
+      }
+    }
+
+    if (!q) {
+      return { statusCode: 400, headers: defaultHeaders, body: JSON.stringify({ error: 'Missing query param "q". Example: ?q=never%20gonna%20give%20you%20up' }) };
+    }
+
+    const api = new YouTubeMusicApi();
+    if (typeof api.initalize === 'function') await api.initalize();
+    else if (typeof api.initialize === 'function') await api.initialize();
+    else if (typeof api.init === 'function') await api.init();
+
+    let rawResults;
+    if (type && ['song', 'video', 'album', 'artist', 'playlist'].includes(type)) rawResults = await api.search(q, type);
+    else rawResults = await api.search(q);
+
+    let items = [];
+
+    if (Array.isArray(rawResults)) {
+      items = rawResults.map(r => normalizeItem(r));
+    } else if (rawResults && typeof rawResults === 'object') {
+      const possibleKeys = ['songs', 'albums', 'videos', 'artists', 'playlists', 'result', 'content', 'resultArray', 'results'];
+      let found = false;
+      for (const k of possibleKeys) {
+        if (rawResults[k]) {
+          found = true;
+          const block = rawResults[k];
+          if (Array.isArray(block)) {
+            items = items.concat(block.map(r => normalizeItem(r, inferTypeFromKey(k))));
+          } else if (block && Array.isArray(block.results || block.contents || block.items)) {
+            const arr = block.results || block.contents || block.items;
+            items = items.concat(arr.map(r => normalizeItem(r, inferTypeFromKey(k))));
+          } else if (block && typeof block === 'object') {
+            const arr = block.results || block.contents || block.items || [];
+            items = items.concat((Array.isArray(arr) ? arr : []).map(r => normalizeItem(r, inferTypeFromKey(k))));
+          }
+        }
+      }
+      if (!found) {
+        for (const v of Object.values(rawResults)) {
+          if (Array.isArray(v)) {
+            items = items.concat(v.map(r => normalizeItem(r)));
+          }
+        }
+      }
+    }
+
+    items = items.slice(0, limit);
+
+    return { statusCode: 200, headers: defaultHeaders, body: JSON.stringify({ query: q, type: type || 'all', count: items.length, items }) };
+
+  } catch (err) {
+    console.error('Netlify function search error:', err);
+    const message = err && err.message ? err.message : String(err);
+    return { statusCode: 500, headers: defaultHeaders, body: JSON.stringify({ error: 'Failed to search YouTube Music', details: message }) };
+  }
+};
