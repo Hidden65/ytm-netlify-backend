@@ -15,6 +15,7 @@
   "type": "commonjs",
   "dependencies": {
     "newpipe-extractor-js": "^1.0.33",
-    "youtube-music-api": "^1.0.0"
+    "youtube-dl-exec": "^3.0.26",
+    "youtube-music-api": "^1.0.6"
   }
 }
