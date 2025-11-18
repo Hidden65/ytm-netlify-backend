@@ -102,6 +102,130 @@ function detectType(raw) {
   return 'other';
 }
 
+// ------------------ NewPipe extraction helpers ------------------
+
+// Try to call common export names on community NewPipe JS ports.
+// This is defensive: packages differ; we attempt a few names.
+async function tryNewPipeExtract(videoId) {
+  let NewPipe;
+  try {
+    NewPipe = require('newpipe-extractor-js');
+  } catch (e) {
+    // not installed or cannot load
+    throw new Error('newpipe-extractor-js not installed or failed to load');
+  }
+
+  // possible function names that ports expose
+  const tryFns = [
+    'getInfo',
+    'getVideoInfo',
+    'getStreams',
+    'extract',
+    'fetchInfo',
+    'getStreamInfo',
+    'getVideo'
+  ];
+
+  let info = null;
+  for (const fn of tryFns) {
+    if (NewPipe && typeof NewPipe[fn] === 'function') {
+      try {
+        // many ports accept video id or full youtube url
+        info = await NewPipe[fn](videoId);
+        if (info) break;
+      } catch (err) {
+        // try next
+        continue;
+      }
+    }
+  }
+
+  // Some packages export a default function directly
+  if (!info && typeof NewPipe === 'function') {
+    try {
+      info = await NewPipe(videoId);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  if (!info) {
+    // last attempt: some ports have 'default' export with functions
+    const np = NewPipe && NewPipe.default ? NewPipe.default : null;
+    if (np) {
+      for (const fn of tryFns) {
+        if (np && typeof np[fn] === 'function') {
+          try {
+            info = await np[fn](videoId);
+            if (info) break;
+          } catch (err) {
+            continue;
+          }
+        }
+      }
+      if (!info && typeof np === 'function') {
+        try { info = await np(videoId); } catch (_) {}
+      }
+    }
+  }
+
+  if (!info) throw new Error('NewPipe extractor did not return info (incompatible API)');
+
+  // Normalize expected shapes:
+  // - info.streams / info.formats / info.media / info.availableFormats etc.
+  let formats = [];
+  if (Array.isArray(info.streams)) formats = info.streams;
+  else if (Array.isArray(info.formats)) formats = info.formats;
+  else if (info && Array.isArray(info.availableFormats)) formats = info.availableFormats;
+  else if (info && Array.isArray(info.media)) formats = info.media;
+  else if (info && info.streams && typeof info.streams === 'object') {
+    formats = Object.values(info.streams).flatMap(v => Array.isArray(v) ? v : [v]);
+  } else {
+    // try to find arrays inside info
+    for (const v of Object.values(info)) {
+      if (Array.isArray(v)) {
+        formats = formats.concat(v);
+      }
+    }
+  }
+
+  // normalize each format into { url, mimeType, bitrate, qualityLabel, audioBitrate, isAudioOnly }
+  const normalizedFormats = formats.map((f) => {
+    try {
+      const url = f.url || f.uri || f.downloadUrl || f.directUrl || f.cdnUrl || null;
+      const mimeType = f.mimeType || f.type || f.contentType || null;
+      const bitrate = f.bitrate || f.bps || f.audioBitrate || f.avgBitrate || null;
+      const audioBitrate = f.audioBitrate || f.abitrate || (f.bitrate && Number(f.bitrate)) || null;
+      const qualityLabel = f.qualityLabel || f.quality || f.label || null;
+      const isAudioOnly = !!(mimeType && (mimeType.includes('audio') || (f.acodec && !f.vcodec) || (f.audioOnly === true)));
+      return { url, mimeType, bitrate, audioBitrate, qualityLabel, isAudioOnly, raw: f };
+    } catch (err) {
+      return { url: null, mimeType: null, bitrate: null, audioBitrate: null, qualityLabel: null, isAudioOnly: false, raw: f };
+    }
+  }).filter(f => f.url);
+
+  return { info, formats: normalizedFormats };
+}
+
+function pickBestAudio(formats) {
+  if (!Array.isArray(formats) || formats.length === 0) return null;
+  // Prefer audio-only formats with highest audioBitrate then highest bitrate
+  const audioOnly = formats.filter(f => f.isAudioOnly);
+  const sortByAudioQuality = (a, b) => {
+    const ab = Number(a.audioBitrate || a.bitrate || 0);
+    const bb = Number(b.audioBitrate || b.bitrate || 0);
+    return bb - ab;
+  };
+  if (audioOnly.length > 0) {
+    audioOnly.sort(sortByAudioQuality);
+    return audioOnly[0];
+  }
+  // fallback: prefer any format with higher bitrate
+  const byBitrate = formats.slice().sort((a, b) => (Number(b.bitrate || 0) - Number(a.bitrate || 0)));
+  return byBitrate[0];
+}
+
+// ------------------ Netlify handler ------------------
 exports.handler = async function (event, context) {
   const defaultHeaders = {
     "Access-Control-Allow-Origin": "*",
@@ -115,6 +239,37 @@ exports.handler = async function (event, context) {
     const type = (params.type || '').trim().toLowerCase(); // optional: song|video|album|artist|playlist
     const limit = Math.min(50, parseInt(params.limit || '25', 10) || 25);
 
+    // If this is an extraction request, handle separately
+    const extract = (params.extract === 'true' || params.action === 'extract' || params.extract === '1');
+    const videoIdParam = (params.videoId || params.id || params.video || params.v || '').trim();
+
+    if (extract) {
+      if (!videoIdParam) {
+        return { statusCode: 400, headers: defaultHeaders, body: JSON.stringify({ error: 'Missing videoId for extraction. Use ?extract=true&videoId=<id>' }) };
+      }
+      // attempt extraction via newpipe-extractor-js
+      try {
+        const prefer = (params.extract_prefer || 'audio').toLowerCase();
+        const exLimit = Math.min(50, parseInt(params.extract_limit || '10', 10) || 10);
+        const npResult = await tryNewPipeExtract(videoIdParam);
+        const formats = npResult.formats || [];
+        const best = prefer === 'video' ? (formats[0] || null) : pickBestAudio(formats);
+        const reply = {
+          extractor: 'newpipe-extractor-js',
+          videoId: videoIdParam,
+          info: npResult.info || null,
+          availableFormatsCount: formats.length,
+          formats: formats.slice(0, exLimit),
+          best
+        };
+        return { statusCode: 200, headers: defaultHeaders, body: JSON.stringify(reply) };
+      } catch (err) {
+        console.error('NewPipe extraction failed:', err && err.message ? err.message : String(err));
+        return { statusCode: 500, headers: defaultHeaders, body: JSON.stringify({ error: 'Extraction failed', details: err && err.message ? err.message : String(err) }) };
+      }
+    }
+
+    // Otherwise, regular search flow (unchanged)
     if (!q) {
       return {
         statusCode: 400,
