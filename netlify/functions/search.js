@@ -1,8 +1,10 @@
 // netlify/functions/search.js
-// Prereq: npm install youtube-music-api
+// Prereqs (install in your project):
+// npm install youtube-music-api
 // Optional: npm install newpipe-extractor-js youtube-dl-exec
 
 const YouTubeMusicApi = require('youtube-music-api');
+const util = require('util');
 
 // ------------------ Helpers (normalize, detect, extract video id) ------------------
 function normalizeItem(raw, typeHint) {
@@ -91,101 +93,165 @@ function inferTypeFromKey(k) {
   return null;
 }
 
-// ------------------ NewPipe extraction helpers (robust) ------------------
-const util = require('util');
+// ------------------ NewPipe extraction helpers (works with newpipe-extractor-js API) ------------------
 
-async function tryNewPipeExtract(videoId) {
-  function inspectModule(m) {
-    try {
-      if (!m) return { type: 'undefined' };
-      const keys = Object.keys(m);
-      const hasDefault = !!m.default;
-      const typeofDefault = m.default ? typeof m.default : null;
-      return { type: typeof m, keys, hasDefault, typeofDefault };
-    } catch (e) {
-      return { error: String(e) };
+async function tryNewPipeExtract(videoIdOrUrl) {
+  // try to require the module
+  let np;
+  try {
+    // package name observed in your environment
+    // eslint-disable-next-line global-require,import/no-dynamic-require
+    np = require('newpipe-extractor-js');
+  } catch (e) {
+    // if not installed, throw helpful message
+    throw new Error('Failed to require newpipe-extractor-js: ' + (e && e.message ? e.message : String(e)));
+  }
+
+  console.log('newpipe-extractor-js loaded — available keys:', Object.keys(np));
+
+  // init if available
+  try {
+    if (typeof np.initializeNewPipe === 'function') {
+      console.log('Calling initializeNewPipe()');
+      await np.initializeNewPipe();
+    } else if (typeof np.initializeNewPipeWithPoToken === 'function') {
+      console.log('Calling initializeNewPipeWithPoToken()');
+      // initializeNewPipeWithPoToken can accept args in some builds; call without args first
+      await np.initializeNewPipeWithPoToken();
+    } else if (typeof np.initialize === 'function') {
+      console.log('Calling initialize()');
+      await np.initialize();
+    }
+  } catch (e) {
+    console.log('NewPipe initialize call failed/returned (non-fatal):', e && e.message ? e.message : e);
+  }
+
+  // determine videoId from input
+  let videoId = videoIdOrUrl;
+  if (typeof videoIdOrUrl === 'string' && videoIdOrUrl.includes('youtube')) {
+    if (typeof np.extractVideoIdFromUrl === 'function') {
+      try {
+        const extracted = await np.extractVideoIdFromUrl(videoIdOrUrl);
+        if (extracted) videoId = extracted;
+      } catch (e) {
+        console.log('extractVideoIdFromUrl failed:', e && e.message ? e.message : e);
+      }
+    } else {
+      const m = String(videoIdOrUrl).match(/[?&]v=([^&]+)/) || String(videoIdOrUrl).match(/\/embed\/([^?&/]+)/) || String(videoIdOrUrl).match(/\/watch\/([^?&/]+)/);
+      if (m) videoId = m[1];
     }
   }
 
-  const packageNames = [
-    'newpipe-extractor-js',
-    'newpipe-extractor',
-    'newpipe-extractor-core',
-    '@newpipe/extractor',
-    'newpipe-extractor-native'
-  ];
+  if (!videoId) throw new Error('Could not determine videoId from input: ' + String(videoIdOrUrl));
 
-  let lastRequireError = null;
-  let loaded = null;
-  let whichPackage = null;
+  // We'll try several extractor functions that exist in the module
+  let rawInfo = null;
+  let rawFormats = [];
 
-  for (const pkg of packageNames) {
-    try {
-      // eslint-disable-next-line global-require,import/no-dynamic-require
-      const mod = require(pkg);
-      loaded = mod;
-      whichPackage = pkg;
-      break;
-    } catch (err) {
-      lastRequireError = err;
+  const pushFormatsFrom = (candidate) => {
+    if (!candidate) return;
+    if (Array.isArray(candidate)) {
+      rawFormats = rawFormats.concat(candidate);
+      return;
     }
-  }
-
-  if (!loaded) {
-    try {
-      // eslint-disable-next-line global-require
-      loaded = require('newpipe-extractor-js');
-      whichPackage = 'newpipe-extractor-js';
-    } catch (err) {
-      throw new Error('No NewPipe extractor package found. Require attempts failed. Last require error: ' + (lastRequireError && lastRequireError.message ? lastRequireError.message : String(lastRequireError)));
+    if (candidate.streams && Array.isArray(candidate.streams)) {
+      rawFormats = rawFormats.concat(candidate.streams);
+      return;
     }
-  }
+    if (candidate.formats && Array.isArray(candidate.formats)) {
+      rawFormats = rawFormats.concat(candidate.formats);
+      return;
+    }
+    if (typeof candidate === 'object') {
+      rawFormats.push(candidate);
+      return;
+    }
+  };
 
   try {
-    const inspectInfo = inspectModule(loaded);
-    console.log('Loaded NewPipe module:', whichPackage, inspectInfo);
-  } catch (e) {
-    console.log('Loaded NewPipe module but inspect failed:', e && e.message ? e.message : e);
-  }
-
-  const callAttempts = [
-    async (mod) => mod.getInfo && await mod.getInfo(videoId),
-    async (mod) => mod.getVideoInfo && await mod.getVideoInfo(videoId),
-    async (mod) => mod.getStreams && await mod.getStreams(videoId),
-    async (mod) => mod.getStreamInfo && await mod.getStreamInfo(videoId),
-    async (mod) => mod.extract && await mod.extract(videoId),
-    async (mod) => mod.fetchInfo && await mod.fetchInfo(videoId),
-    async (mod) => (typeof mod === 'function' ? await mod(videoId) : null),
-    async (mod) => (mod.default && typeof mod.default === 'function' ? await mod.default(videoId) : null),
-    async (mod) => (mod.video && typeof mod.video.getInfo === 'function' ? await mod.video.getInfo(videoId) : null),
-    async (mod) => (mod.videoInfo && typeof mod.videoInfo.get === 'function' ? await mod.videoInfo.get(videoId) : null)
-  ];
-
-  let info = null;
-  for (const attempt of callAttempts) {
-    try {
-      info = await attempt(loaded);
-      if (info) break;
-    } catch (err) {
-      console.log('NewPipe call attempt failed (continuing):', err && err.message ? err.message : String(err));
-      continue;
-    }
-  }
-
-  if (!info && loaded && loaded.default) {
-    for (const attempt of callAttempts) {
+    // 1) getBestAudioStream (preferred)
+    if (typeof np.getBestAudioStream === 'function') {
       try {
-        info = await attempt(loaded.default);
-        if (info) break;
-      } catch (err) {
-        console.log('NewPipe.default call attempt failed:', err && err.message ? err.message : String(err));
-        continue;
+        const best = await np.getBestAudioStream(videoId);
+        if (best) {
+          pushFormatsFrom(best);
+          rawInfo = rawInfo || {};
+          rawInfo.bestAudio = best;
+        }
+      } catch (e) {
+        console.log('getBestAudioStream failed:', e && e.message ? e.message : e);
       }
     }
+
+    // 2) extractStreamInfo
+    if (rawFormats.length === 0 && typeof np.extractStreamInfo === 'function') {
+      try {
+        const info = await np.extractStreamInfo(videoId);
+        rawInfo = rawInfo || info || {};
+        pushFormatsFrom(info);
+      } catch (e) {
+        console.log('extractStreamInfo failed:', e && e.message ? e.message : e);
+      }
+    }
+
+    // 3) getDashStreams
+    if (rawFormats.length === 0 && typeof np.getDashStreams === 'function') {
+      try {
+        const dash = await np.getDashStreams(videoId);
+        rawInfo = rawInfo || {};
+        pushFormatsFrom(dash);
+      } catch (e) {
+        console.log('getDashStreams failed:', e && e.message ? e.message : e);
+      }
+    }
+
+    // 4) getBestDashAudioStream
+    if (rawFormats.length === 0 && typeof np.getBestDashAudioStream === 'function') {
+      try {
+        const bestDash = await np.getBestDashAudioStream(videoId);
+        if (bestDash) {
+          pushFormatsFrom(bestDash);
+          rawInfo = rawInfo || {};
+          rawInfo.bestDash = bestDash;
+        }
+      } catch (e) {
+        console.log('getBestDashAudioStream failed:', e && e.message ? e.message : e);
+      }
+    }
+
+    // 5) getBestVideoStream (if audio-only not found)
+    if (rawFormats.length === 0 && typeof np.getBestVideoStream === 'function') {
+      try {
+        const bestVideo = await np.getBestVideoStream(videoId);
+        if (bestVideo) {
+          pushFormatsFrom(bestVideo);
+          rawInfo = rawInfo || {};
+          rawInfo.bestVideo = bestVideo;
+        }
+      } catch (e) {
+        console.log('getBestVideoStream failed:', e && e.message ? e.message : e);
+      }
+    }
+
+    // 6) findBestAudioFormat
+    if (rawFormats.length === 0 && typeof np.findBestAudioFormat === 'function') {
+      try {
+        const best = await np.findBestAudioFormat(videoId);
+        if (best) {
+          pushFormatsFrom(best);
+          rawInfo = rawInfo || {};
+          rawInfo.findBest = best;
+        }
+      } catch (e) {
+        console.log('findBestAudioFormat failed:', e && e.message ? e.message : e);
+      }
+    }
+  } catch (err) {
+    console.log('Unexpected error while calling newpipe APIs:', err && err.message ? err.message : err);
   }
 
-  // Fallback to youtube-dl-exec if available
-  if (!info) {
+  // Fallback: try youtube-dl-exec if available (optional)
+  if ((!rawFormats || rawFormats.length === 0)) {
     try {
       // eslint-disable-next-line global-require
       const ytdlExec = require('youtube-dl-exec');
@@ -224,42 +290,47 @@ async function tryNewPipeExtract(videoId) {
     }
   }
 
-  if (!info) {
-    const modInfo = inspectModule(loaded);
-    const diag = `NewPipe extractor did not return info (incompatible API). Module: ${whichPackage}. Module keys: ${JSON.stringify(modInfo.keys || [])}`;
-    if (lastRequireError && lastRequireError.message) {
-      console.log('Last require error:', lastRequireError.message);
-    }
-    throw new Error(diag);
+  if (!rawFormats || rawFormats.length === 0) {
+    const keys = Object.keys(np || {});
+    throw new Error('NewPipe extractor did not return formats. Available keys: ' + JSON.stringify(keys));
   }
 
-  let formats = [];
-  if (Array.isArray(info.formats)) formats = info.formats;
-  else if (Array.isArray(info.streams)) formats = info.streams;
-  else {
-    for (const v of Object.values(info)) {
-      if (Array.isArray(v) && v.length > 0 && typeof v[0] === 'object') {
-        formats = v;
-        break;
-      }
-    }
-  }
-
-  const normalizedFormats = (formats || []).map((f) => {
+  // Normalize rawFormats to expected output
+  const normalized = rawFormats.map((f) => {
     try {
-      const url = f.url || f.uri || f.downloadUrl || f.direct_url || f.directUrl || f.cdnUrl || null;
+      const url = f.url || f.uri || f.audioUrl || f.baseUrl || f.cdnUrl || f.downloadUrl || f.mediaUrl || f.urlString || null;
       const mimeType = f.mimeType || f.type || f.contentType || f.ext || null;
       const bitrate = f.bitrate || f.bps || f.tbr || null;
       const audioBitrate = f.audioBitrate || f.abr || null;
-      const qualityLabel = f.qualityLabel || f.quality || f.label || f.format_note || null;
-      const isAudioOnly = !!((mimeType && mimeType.includes && mimeType.includes('audio')) || (f.acodec && !f.vcodec) || (f.vcodec === 'none'));
+      const qualityLabel = f.qualityLabel || f.quality || f.label || f.format || f.format_note || null;
+      const isAudioOnly =
+        !!(
+          (mimeType && typeof mimeType === 'string' && mimeType.includes('audio')) ||
+          (f.acodec && !f.vcodec) ||
+          (f.vcodec === 'none') ||
+          (f.type && String(f.type).toLowerCase().includes('audio'))
+        );
       return { url, mimeType, bitrate, audioBitrate, qualityLabel, isAudioOnly, raw: f };
-    } catch (err) {
+    } catch (e) {
       return { url: null, mimeType: null, bitrate: null, audioBitrate: null, qualityLabel: null, isAudioOnly: false, raw: f };
     }
-  }).filter(f => f.url);
+  }).filter(x => x.url);
 
-  return { info, formats: normalizedFormats };
+  if (normalized.length === 0) {
+    throw new Error('No usable URLs found in NewPipe extract output.');
+  }
+
+  // de-duplicate identical URLs
+  const seen = new Set();
+  const dedup = [];
+  for (const f of normalized) {
+    if (!seen.has(f.url)) {
+      seen.add(f.url);
+      dedup.push(f);
+    }
+  }
+
+  return { info: rawInfo || null, formats: dedup };
 }
 
 // ------------------ Utility for selecting best audio ------------------
@@ -309,7 +380,7 @@ exports.handler = async function (event, context) {
         const reply = { extractor: 'newpipe-extractor-js-or-fallback', videoId: videoIdParam, info: npResult.info || null, availableFormatsCount: formats.length, formats: formats.slice(0, exLimit), best };
         return { statusCode: 200, headers: defaultHeaders, body: JSON.stringify(reply) };
       } catch (err) {
-        console.error('NewPipe extraction failed:', err && err.message ? err.message : String(err));
+        console.error('Extraction failed:', err && err.message ? err.message : String(err));
         return { statusCode: 500, headers: defaultHeaders, body: JSON.stringify({ error: 'Extraction failed', details: err && err.message ? err.message : String(err) }) };
       }
     }
