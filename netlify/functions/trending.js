@@ -1,127 +1,145 @@
 // netlify/functions/trending.js
 const YouTubeMusicApi = require('youtube-music-api');
 
-// --- copy of normalize helpers (same as search.js) ---
-function normalizeItem(raw, typeHint) {
-  try {
-    const coerceToArray = (val) => {
-      if (!val && val !== 0) return [];
-      if (Array.isArray(val)) return val;
-      if (typeof val === 'object') {
-        if (val.name && typeof val.name === 'string') return [{ name: val.name }];
-        return Object.values(val).filter(Boolean);
-      }
-      return [val];
-    };
-    const extractNameFromArtistEntry = (a) => {
-      if (!a && a !== 0) return null;
-      if (typeof a === 'string') return a;
-      if (typeof a === 'object') {
-        return a.name || a.title || a.artist || null;
-      }
-      return null;
-    };
+let api = null;
 
-    const type = typeHint || raw.type || detectType(raw);
-    const title = raw.title || raw.name || raw.subtitle || '';
-    const id = raw.videoId || raw.entityId || raw.browseId || raw.id || raw.video_id || '';
-    const artistsRaw = raw.artists || raw.artist || raw.subtitles || [];
-    const artistsArr = coerceToArray(artistsRaw);
-    const artists = artistsArr.map(extractNameFromArtistEntry).filter(Boolean);
-
-    let thumbnails = [];
-    if (Array.isArray(raw.thumbnails)) thumbnails = raw.thumbnails;
-    else if (raw.thumbnail) thumbnails = (Array.isArray(raw.thumbnail) ? raw.thumbnail : [raw.thumbnail]);
-    else if (raw.thumbs) thumbnails = raw.thumbs;
-    else thumbnails = [];
-
-    const duration = raw.duration || raw.length || raw.duration_seconds || null;
-    const videoId = raw.videoId || raw.id || (raw.url && extractVideoId(raw.url)) || null;
-    const watchUrl = videoId ? `https://www.youtube.com/watch?v=${videoId}` : null;
-    const embedUrl = videoId ? `https://www.youtube.com/embed/${videoId}` : null;
-
-    return { type, id, title, artists, thumbnails, duration, raw, videoId, watchUrl, embedUrl };
-  } catch (err) {
-    return {
-      type: typeHint || (raw && raw.type) || 'unknown',
-      id: raw && (raw.videoId || raw.id || raw.entityId) || null,
-      title: raw && (raw.title || raw.name) || null,
-      artists: [],
-      thumbnails: [],
-      duration: null,
-      raw,
-      videoId: raw && (raw.videoId || raw.id) || null,
-      watchUrl: null,
-      embedUrl: null,
-      warning: 'normalizeItem failed: ' + (err && err.message ? err.message : String(err))
-    };
+async function initYTMusic() {
+  if (!api) {
+    api = new YouTubeMusicApi();
+    await api.initalize();
   }
+  return api;
 }
 
-function extractVideoId(url) {
-  if (!url) return null;
-  const m = url.match(/[?&]v=([^&]+)/) || url.match(/\/watch\/([^?&/]+)/) || url.match(/\/embed\/([^?&/]+)/);
-  return m ? m[1] : null;
-}
-function detectType(raw) {
-  if (!raw) return 'unknown';
-  if (raw.type) return raw.type;
-  if (raw.videoId) return 'song';
-  if (raw.browseId && raw.title && raw.subtitle && raw.thumbnail) {
-    if ((raw.subtitle || '').toLowerCase().includes('songs')) return 'album';
+function mapSongResult(item) {
+  const videoId = item.videoId || item.id;
+  const title = item.name || item.title || 'Unknown Title';
+  
+  let artist = 'Unknown Artist';
+  if (item.artist && Array.isArray(item.artist) && item.artist.length > 0) {
+    artist = item.artist.map(a => a.name).filter(Boolean).join(', ');
+  } else if (typeof item.artist === 'string') {
+    artist = item.artist;
+  } else if (item.author) {
+    artist = item.author;
   }
-  return 'other';
+  
+  let duration = item.duration;
+  if (typeof duration === 'number') {
+    const mins = Math.floor(duration / 60000);
+    const secs = Math.floor((duration % 60000) / 1000);
+    duration = `${mins}:${secs.toString().padStart(2, '0')}`;
+  }
+  
+  let thumbnail = null;
+  if (item.thumbnails && Array.isArray(item.thumbnails) && item.thumbnails.length > 0) {
+    thumbnail = item.thumbnails[item.thumbnails.length - 1].url;
+  } else if (item.thumbnail) {
+    thumbnail = item.thumbnail;
+  }
+  
+  return {
+    videoId,
+    title,
+    artist,
+    duration,
+    thumbnail
+  };
 }
 
 exports.handler = async function (event, context) {
-  const defaultHeaders = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "Content-Type",
-    "Content-Type": "application/json"
-  };
-
   try {
-    const params = event.queryStringParameters || {};
-    const limit = Math.min(50, parseInt(params.limit || '25', 10) || 25);
-    const region = params.region || params.country || ''; // optional
-
-    const api = new YouTubeMusicApi();
-    if (typeof api.initalize === 'function') await api.initalize();
-    else if (typeof api.initialize === 'function') await api.initialize();
-    else if (typeof api.init === 'function') await api.init();
-
-    // try common method names for trending
-    let raw;
-    if (typeof api.trending === 'function') raw = await api.trending(region);
-    else if (typeof api.getTrending === 'function') raw = await api.getTrending(region);
-    else if (typeof api.get_top_charts === 'function') raw = await api.get_top_charts(region);
-    else raw = {};
-
-    // normalize result: if it's an object with lists, flatten
-    let items = [];
-    if (Array.isArray(raw)) items = raw.map(r => normalizeItem(r)).slice(0, limit);
-    else if (raw && typeof raw === 'object') {
-      // common keys that may contain entries
-      const keys = ['items', 'results', 'tracks', 'songs', 'videos', 'content', 'charts'];
-      for (const k of keys) {
-        if (raw[k] && Array.isArray(raw[k])) items = items.concat(raw[k].map(r => normalizeItem(r)));
-      }
-      // fallback: collect array-like values
-      if (items.length === 0) {
-        for (const val of Object.values(raw)) {
-          if (Array.isArray(val)) items = items.concat(val.map(r => normalizeItem(r)));
+    const ytmusic = await initYTMusic();
+    
+    // Try multiple strategies to get trending music
+    let results = [];
+    
+    // Strategy 1: Search for "Top 50 Global" playlist
+    try {
+      const playlistSearch = await ytmusic.search('Top 50 Global', 'playlist');
+      if (playlistSearch.content && playlistSearch.content.length > 0) {
+        const topPlaylistId = playlistSearch.content[0].browseId || playlistSearch.content[0].playlistId;
+        if (topPlaylistId) {
+          const playlist = await ytmusic.getPlaylist(topPlaylistId);
+          if (playlist.content && playlist.content.length > 0) {
+            results = playlist.content.slice(0, 30).map(mapSongResult);
+          }
         }
       }
-      items = items.slice(0, limit);
+    } catch (e) {
+      console.log('Strategy 1 failed:', e.message);
     }
-
+    
+    // Strategy 2: Search for popular/trending songs
+    if (results.length === 0) {
+      try {
+        const trendingQueries = [
+          'top hits 2024',
+          'viral songs',
+          'trending music',
+          'popular songs'
+        ];
+        
+        for (const query of trendingQueries) {
+          const searchResult = await ytmusic.search(query, 'song');
+          if (searchResult.content && searchResult.content.length > 0) {
+            results = searchResult.content.slice(0, 30).map(mapSongResult);
+            break;
+          }
+        }
+      } catch (e) {
+        console.log('Strategy 2 failed:', e.message);
+      }
+    }
+    
+    // Strategy 3: Get popular playlists and extract songs
+    if (results.length === 0) {
+      try {
+        const playlistSearch = await ytmusic.search('hot hits', 'playlist');
+        if (playlistSearch.content && playlistSearch.content.length > 0) {
+          const playlistId = playlistSearch.content[0].browseId || playlistSearch.content[0].playlistId;
+          if (playlistId) {
+            const playlist = await ytmusic.getPlaylist(playlistId);
+            if (playlist.content) {
+              results = playlist.content.slice(0, 30).map(mapSongResult);
+            }
+          }
+        }
+      } catch (e) {
+        console.log('Strategy 3 failed:', e.message);
+      }
+    }
+    
+    // Filter out any invalid results
+    results = results.filter(r => r && r.videoId);
+    
     return {
       statusCode: 200,
-      headers: defaultHeaders,
-      body: JSON.stringify({ source: 'trending', count: items.length, items })
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type'
+      },
+      body: JSON.stringify({ 
+        results,
+        count: results.length,
+        source: 'trending'
+      })
     };
   } catch (err) {
-    console.error('trending function error:', err);
-    return { statusCode: 500, headers: defaultHeaders, body: JSON.stringify({ error: 'Failed to fetch trending', details: err && err.message || String(err) }) };
+    console.error('Trending error:', err);
+    return {
+      statusCode: 500,
+      headers: { 
+        'Content-Type': 'application/json',
+        'Access-Control-Allow-Origin': '*'
+      },
+      body: JSON.stringify({
+        error: 'Failed to fetch trending music',
+        details: err.message,
+        results: []
+      })
+    };
   }
 };
